@@ -1,0 +1,56 @@
+name: TLA+ Model Checking
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'kubernetes/tla/**/*.tla'
+      - 'kubernetes/tla/**/*.cfg'
+      - '.github/workflows/tla-check.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'kubernetes/tla/**/*.tla'
+      - 'kubernetes/tla/**/*.cfg'
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  tla-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+    
+    - name: Install TLA+ Tools
+      run: |
+        wget https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+        echo "TLA2TOOLS_JAR=$(pwd)/tla2tools.jar" >> $GITHUB_ENV
+    
+    - name: Run TLC on dpu_multi_tenant
+      run: |
+        cd kubernetes/tla
+        java -XX:+UseParallelGC -cp $TLA2TOOLS_JAR tlc2.TLC \
+          -workers auto \
+          -config dpu_multi_tenant.cfg \
+          dpu_multi_tenant.tla
+    
+    - name: Upload TLC output
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: tlc-output
+        path: |
+          kubernetes/tla/states/
+          kubernetes/tla/*.out
+        retention-days: 30
