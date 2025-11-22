@@ -151,12 +151,14 @@ DPUReconcile ==
         /\ LET valid_crs == dpu_crs[r, t_id] \ dpu_crs_delete_queue[r, t_id]  \* Exclude CRs pending deletion
                target_nodes == {n \in valid_crs : <<r, d_id>> \in NodeDPUs[n]}
                to_remove == dpu_hw[r, t_id, d_id] \ target_nodes
-               to_add == target_nodes \ dpu_hw[r, t_id, d_id]
-           IN /\ (to_remove # {} \/ to_add # {})  \* Something to reconcile
+               potential_adds == target_nodes \ dpu_hw[r, t_id, d_id]
+               \* Check for isolation conflicts before adding
+               safe_adds == {n \in potential_adds : \A t_other \in Tenants \ {t_id} : n \notin dpu_hw[r, t_other, d_id]}
+           IN /\ (to_remove # {} \/ safe_adds # {})  \* Something to reconcile
               /\ dpu_hw' = [dpu_hw EXCEPT ![r, t_id, d_id] = 
                               IF to_remove # {}
                               THEN @ \ {CHOOSE n \in to_remove : TRUE}  \* Remove one node
-                              ELSE @ \cup {CHOOSE n \in to_add : TRUE}]  \* Or add one node
+                              ELSE @ \cup {CHOOSE n \in safe_adds : TRUE}]  \* Or add one node
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_reclaiming, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, 
                        tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_online, rack_power>>
@@ -368,6 +370,10 @@ EtcdRegainQuorum ==
 (* Manual Drift: Simulate external changes to hardware state *)
 ManualDrift ==
     \E r \in Racks, t \in Tenants, d \in DPUs, n \in Nodes :
+        /\ <<r, d>> \in NodeDPUs[n]  \* Ensure we only drift nodes to their correct DPU
+        /\ IF n \notin dpu_hw[r, t, d]
+           THEN \A t_other \in Tenants \ {t} : n \notin dpu_hw[r, t_other, d]
+           ELSE TRUE
         /\ dpu_hw' = [dpu_hw EXCEPT ![r, t, d] = 
                         IF n \in @ THEN @ \ {n} ELSE @ \cup {n}]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_reclaiming, tenant_events,
