@@ -13,7 +13,9 @@ CONSTANTS
     Nodes,          \* Physical nodes, e.g., {"n1", "n2"}
     Racks,          \* Physical racks, e.g., {"r1"}
     DPUs,           \* DPUs per rack, e.g., {"d1", "d2"}
-    Tenants         \* Customer tenants, e.g., {"t1", "t2"}
+    Tenants,        \* Customer tenants, e.g., {"t1", "t2"}
+    NodeRack,       \* Node -> Rack mapping. Each node belongs to exactly one rack.
+    NodeDPUs        \* Node -> Set of <<Rack, DPU>> pairs. Defines which DPUs should be programmed for each node.
 
 VARIABLES 
     mgmt_nodes,             \* Management plane unassigned nodes: Set of Nodes
@@ -28,13 +30,14 @@ VARIABLES
     tenant_etcd_quorum,     \* Tenant etcd has quorum: Tenant -> Boolean
     tenant_dpu_network,     \* Network connectivity tenant->DPU: Tenant -> Boolean
     dpu_crs,                \* DPU CRs in etcd: <<Rack, Tenant>> -> Set of Nodes
+    dpu_crs_delete_queue,   \* Nodes pending deletion from CRs: <<Rack, Tenant>> -> Set of Nodes
     dpu_hw,                 \* DPU hardware state: <<Rack, Tenant, DPU>> -> Set of Nodes
     dpu_online,             \* DPU status: <<Rack, DPU>> -> Boolean
     rack_power              \* Rack power: Rack -> Boolean
 
 Vars == <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, tenant_buffer, 
           tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, tenant_dpu_network,
-          dpu_crs, dpu_hw, dpu_online, rack_power>>
+          dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 Init ==
     /\ mgmt_nodes = Nodes
@@ -49,6 +52,7 @@ Init ==
     /\ tenant_etcd_quorum = [t_id \in Tenants |-> TRUE]
     /\ tenant_dpu_network = [t_id \in Tenants |-> TRUE]
     /\ dpu_crs = [r_id \in Racks, t_id \in Tenants |-> {}]
+    /\ dpu_crs_delete_queue = [r_id \in Racks, t_id \in Tenants |-> {}]
     /\ dpu_hw = [r_id \in Racks, t_id \in Tenants, d_id \in DPUs |-> {}]
     /\ dpu_online = [r_id \in Racks, d_id \in DPUs |-> TRUE]
     /\ rack_power = [r_id \in Racks |-> TRUE]
@@ -64,7 +68,7 @@ MgmtAssign ==
         /\ tenant_events' = [tenant_events EXCEPT ![t_id] = @ \cup {n_ode}]
         /\ UNCHANGED <<mgmt_controller_up, mgmt_tenant_network, tenant_buffer, tenant_controller_up, 
                        tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, tenant_dpu_network,
-                       dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Management Plane: Reclaim node from tenant *)
 MgmtReclaim ==
@@ -76,17 +80,14 @@ MgmtReclaim ==
         /\ tenant_nodes' = [tenant_nodes EXCEPT ![t_id] = @ \ {n_ode}]
         /\ mgmt_nodes' = mgmt_nodes \cup {n_ode}
         /\ tenant_events' = [tenant_events EXCEPT ![t_id] = @ \ {n_ode}]  \* Remove from events (DELETE operation)
-        /\ dpu_crs' = [r_id \in Racks, t_en \in Tenants |->
-                        IF t_en = t_id
-                        THEN dpu_crs[r_id, t_en] \ {n_ode}  \* Immediately remove from CRs
-                        ELSE dpu_crs[r_id, t_en]]
-        /\ dpu_hw' = [r_id \in Racks, t_en \in Tenants, d_id \in DPUs |->
-                        IF t_en = t_id
-                        THEN dpu_hw[r_id, t_en, d_id] \ {n_ode}  \* Immediately deprogram hardware
-                        ELSE dpu_hw[r_id, t_en, d_id]]
+        \* Queue deletions instead of immediate removal to model etcd propagation delay
+        /\ dpu_crs_delete_queue' = [r_id \in Racks, t_en \in Tenants |->
+                                      IF t_en = t_id
+                                      THEN dpu_crs_delete_queue[r_id, t_en] \cup {n_ode}
+                                      ELSE dpu_crs_delete_queue[r_id, t_en]]
         /\ UNCHANGED <<mgmt_controller_up, mgmt_tenant_network, tenant_buffer, tenant_controller_up, 
                        tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, tenant_dpu_network,
-                       dpu_online, rack_power>>
+                       dpu_crs, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant Controller: Watch events and buffer them *)
 TenantWatch ==
@@ -98,7 +99,7 @@ TenantWatch ==
             /\ tenant_events' = [tenant_events EXCEPT ![t_id] = @ \ {n_ode}]
             /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_controller_up, 
                            tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, tenant_dpu_network,
-                           dpu_crs, dpu_hw, dpu_online, rack_power>>
+                           dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant Controller: Flush buffer to CRs *)
 TenantFlush ==
@@ -111,24 +112,31 @@ TenantFlush ==
         /\ LET valid_nodes == tenant_buffer[t_id] \cap tenant_nodes[t_id]  \* Only flush nodes still in tenant
            IN dpu_crs' = [r_id \in Racks, t_en \in Tenants |->
                             IF t_en = t_id
-                            THEN dpu_crs[r_id, t_en] \cup valid_nodes
+                            THEN dpu_crs[r_id, t_en] \cup {n \in valid_nodes : NodeRack[n] = r_id}  \* Only nodes in this rack
                             ELSE dpu_crs[r_id, t_en]]
         /\ tenant_buffer' = [tenant_buffer EXCEPT ![t_id] = {}]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, 
-                       tenant_dpu_network, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
-(* DPU: Reconcile CRs to hardware *)
+(* DPU: Reconcile CRs to hardware - incremental add/remove *)
 DPUReconcile ==
     \E r \in Racks, d_id \in DPUs, t_id \in Tenants :
         /\ rack_power[r] = TRUE
         /\ dpu_online[r, d_id] = TRUE
         /\ tenant_dpu_network[t_id] = TRUE  \* Network must be up
-        /\ dpu_hw[r, t_id, d_id] # dpu_crs[r, t_id]
-        /\ dpu_hw' = [dpu_hw EXCEPT ![r, t_id, d_id] = dpu_crs[r, t_id]]
+        \* Only program nodes that should be on this DPU
+        /\ LET target_nodes == {n \in dpu_crs[r, t_id] : <<r, d_id>> \in NodeDPUs[n]}
+               to_remove == dpu_hw[r, t_id, d_id] \ target_nodes
+               to_add == target_nodes \ dpu_hw[r, t_id, d_id]
+           IN /\ (to_remove # {} \/ to_add # {})  \* Something to reconcile
+              /\ dpu_hw' = [dpu_hw EXCEPT ![r, t_id, d_id] = 
+                              IF to_remove # {}
+                              THEN @ \ {CHOOSE n \in to_remove : TRUE}  \* Remove one node
+                              ELSE @ \cup {CHOOSE n \in to_add : TRUE}]  \* Or add one node
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, 
-                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_online, rack_power>>
+                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_online, rack_power>>
 
 (* Tenant Controller: Clean up CRs for removed nodes *)
 TenantCleanup ==
@@ -137,8 +145,20 @@ TenantCleanup ==
         /\ tenant_apiserver_up[t_id] = TRUE
         /\ tenant_etcd_up[t_id] = TRUE
         /\ tenant_etcd_quorum[t_id] = TRUE  \* Need quorum to write
-        /\ dpu_crs[r_id, t_id] \ tenant_nodes[t_id] # {}  \* Some CRs exist for nodes not in tenant
-        /\ dpu_crs' = [dpu_crs EXCEPT ![r_id, t_id] = @ \cap tenant_nodes[t_id]]  \* Remove them
+        /\ LET stale_nodes == dpu_crs[r_id, t_id] \ tenant_nodes[t_id]  \* CRs for nodes not in tenant
+           IN /\ stale_nodes # {}
+              /\ dpu_crs' = [dpu_crs EXCEPT ![r_id, t_id] = @ \ stale_nodes]  \* Remove all stale CRs
+        /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
+                       tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, 
+                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
+
+(* Process CR deletions - models etcd watch propagation *)
+ProcessCRDeletion ==
+    \E t_id \in Tenants, r_id \in Racks :
+        /\ dpu_crs_delete_queue[r_id, t_id] # {}
+        /\ LET nodes_to_delete == dpu_crs_delete_queue[r_id, t_id]
+           IN /\ dpu_crs' = [dpu_crs EXCEPT ![r_id, t_id] = @ \ nodes_to_delete]
+              /\ dpu_crs_delete_queue' = [dpu_crs_delete_queue EXCEPT ![r_id, t_id] = {}]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, 
                        tenant_etcd_quorum, tenant_dpu_network, dpu_hw, dpu_online, rack_power>>
@@ -151,7 +171,7 @@ TenantCrash ==
         /\ tenant_buffer' = [tenant_buffer EXCEPT ![t_id] = {}]  \* Buffer lost!
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, tenant_dpu_network,
-                       dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant Controller: Recover *)
 TenantRecover ==
@@ -162,7 +182,7 @@ TenantRecover ==
         /\ tenant_buffer' = [tenant_buffer EXCEPT ![t_id] = tenant_nodes[t_id]]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum, tenant_dpu_network,
-                       dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant etcd: Failure *)
 EtcdDown ==
@@ -172,7 +192,7 @@ EtcdDown ==
         /\ tenant_etcd_quorum' = [tenant_etcd_quorum EXCEPT ![t_id] = FALSE]  \* Also lose quorum
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_dpu_network,
-                       dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant etcd: Recovery *)
 EtcdUp ==
@@ -182,7 +202,7 @@ EtcdUp ==
         /\ tenant_etcd_quorum' = [tenant_etcd_quorum EXCEPT ![t_id] = TRUE]  \* Also regain quorum
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_dpu_network,
-                       dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant API Server: Failure *)
 ApiServerDown ==
@@ -191,7 +211,7 @@ ApiServerDown ==
         /\ tenant_apiserver_up' = [tenant_apiserver_up EXCEPT ![t_id] = FALSE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_etcd_up, tenant_etcd_quorum, 
-                       tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Tenant API Server: Recovery *)
 ApiServerUp ==
@@ -200,7 +220,7 @@ ApiServerUp ==
         /\ tenant_apiserver_up' = [tenant_apiserver_up EXCEPT ![t_id] = TRUE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_etcd_up, tenant_etcd_quorum, 
-                       tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Rack: Power loss *)
 PowerOff ==
@@ -213,7 +233,7 @@ PowerOff ==
                        IF r_ack = r_id THEN {} ELSE dpu_hw[r_ack, t_id, d_id]]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, 
-                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs>>
+                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_crs_delete_queue>>
 
 (* Rack: Power restored *)
 PowerOn ==
@@ -224,7 +244,7 @@ PowerOn ==
                            IF d_pu = r_id THEN TRUE ELSE dpu_online[d_pu, d_id]]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events, 
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, 
-                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_hw>>
+                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw>>
 
 (* Management Plane: Controller crash *)
 MgmtCrash ==
@@ -232,7 +252,7 @@ MgmtCrash ==
     /\ mgmt_controller_up' = FALSE
     /\ UNCHANGED <<mgmt_nodes, mgmt_tenant_network, tenant_nodes, tenant_events, tenant_buffer,
                    tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum,
-                   tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                   tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Management Plane: Controller recover *)
 MgmtRecover ==
@@ -240,7 +260,7 @@ MgmtRecover ==
     /\ mgmt_controller_up' = TRUE
     /\ UNCHANGED <<mgmt_nodes, mgmt_tenant_network, tenant_nodes, tenant_events, tenant_buffer,
                    tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum,
-                   tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                   tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Network: Management-Tenant partition *)
 MgmtTenantPartition ==
@@ -249,7 +269,7 @@ MgmtTenantPartition ==
         /\ mgmt_tenant_network' = [mgmt_tenant_network EXCEPT ![t_id] = FALSE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, tenant_nodes, tenant_events, tenant_buffer,
                        tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum,
-                       tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Network: Management-Tenant healed *)
 MgmtTenantHeal ==
@@ -258,7 +278,7 @@ MgmtTenantHeal ==
         /\ mgmt_tenant_network' = [mgmt_tenant_network EXCEPT ![t_id] = TRUE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, tenant_nodes, tenant_events, tenant_buffer,
                        tenant_controller_up, tenant_apiserver_up, tenant_etcd_up, tenant_etcd_quorum,
-                       tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Network: Tenant-DPU partition *)
 TenantDPUPartition ==
@@ -267,7 +287,7 @@ TenantDPUPartition ==
         /\ tenant_dpu_network' = [tenant_dpu_network EXCEPT ![t_id] = FALSE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up,
-                       tenant_etcd_quorum, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_etcd_quorum, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Network: Tenant-DPU healed *)
 TenantDPUHeal ==
@@ -276,7 +296,7 @@ TenantDPUHeal ==
         /\ tenant_dpu_network' = [tenant_dpu_network EXCEPT ![t_id] = TRUE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up,
-                       tenant_etcd_quorum, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_etcd_quorum, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* DPU: Individual DPU crash *)
 DPUCrash ==
@@ -290,7 +310,7 @@ DPUCrash ==
                        ELSE dpu_hw[r_ack, t_id, d_pu]]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up,
-                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, rack_power>>
+                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, rack_power>>
 
 (* DPU: Individual DPU recovery *)
 DPURecover ==
@@ -300,7 +320,7 @@ DPURecover ==
         /\ dpu_online' = [dpu_online EXCEPT ![r_id, d_id] = TRUE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up,
-                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_hw, rack_power>>
+                       tenant_etcd_quorum, tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, rack_power>>
 
 (* Etcd: Lose quorum while still up *)
 EtcdLoseQuorum ==
@@ -310,7 +330,7 @@ EtcdLoseQuorum ==
         /\ tenant_etcd_quorum' = [tenant_etcd_quorum EXCEPT ![t_id] = FALSE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up,
-                       tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 (* Etcd: Regain quorum *)
 EtcdRegainQuorum ==
@@ -320,7 +340,7 @@ EtcdRegainQuorum ==
         /\ tenant_etcd_quorum' = [tenant_etcd_quorum EXCEPT ![t_id] = TRUE]
         /\ UNCHANGED <<mgmt_nodes, mgmt_controller_up, mgmt_tenant_network, tenant_nodes, tenant_events,
                        tenant_buffer, tenant_controller_up, tenant_apiserver_up, tenant_etcd_up,
-                       tenant_dpu_network, dpu_crs, dpu_hw, dpu_online, rack_power>>
+                       tenant_dpu_network, dpu_crs, dpu_crs_delete_queue, dpu_hw, dpu_online, rack_power>>
 
 Next ==
     \/ MgmtAssign
@@ -328,6 +348,7 @@ Next ==
     \/ TenantWatch
     \/ TenantFlush
     \/ TenantCleanup
+    \/ ProcessCRDeletion
     \/ DPUReconcile
     \/ TenantCrash
     \/ TenantRecover
@@ -348,15 +369,42 @@ Next ==
     \/ EtcdLoseQuorum
     \/ EtcdRegainQuorum
 
-(* Property: Eventual Consistency - nodes reach hardware if they stay assigned *)
+(* Property: Eventual Consistency - nodes reach hardware in their designated DPUs if they stay assigned *)
 EventualConsistency == 
-    \A n_ode \in Nodes, t_id \in Tenants, r_id \in Racks, d_id \in DPUs : 
-        [](n_ode \in tenant_nodes[t_id]) => <>(n_ode \in dpu_hw[r_id, t_id, d_id])
+    \A n_ode \in Nodes, t_id \in Tenants : 
+        [](n_ode \in tenant_nodes[t_id]) => 
+            <>(
+                \A r_id \in Racks, d_id \in DPUs : 
+                    (<<r_id, d_id>> \in NodeDPUs[n_ode]) => (n_ode \in dpu_hw[r_id, t_id, d_id])
+            )
 
 (* Property: Tenant Isolation - no node appears in multiple tenants' hardware *)
 TenantIsolation ==
     \A n_ode \in Nodes, r_id \in Racks, d_id \in DPUs :
         Cardinality({t_id \in Tenants : n_ode \in dpu_hw[r_id, t_id, d_id]}) <= 1
+
+(* Property: Node Single Assignment - no node is assigned to multiple tenants *)
+NodeSingleAssignment ==
+    \A n_ode \in Nodes :
+        Cardinality({t_id \in Tenants : n_ode \in tenant_nodes[t_id]}) <= 1
+
+(* Property: Rack Affinity - nodes only appear in hardware for their designated rack *)
+RackAffinity ==
+    \A n_ode \in Nodes, r_id \in Racks, t_id \in Tenants, d_id \in DPUs :
+        (n_ode \in dpu_hw[r_id, t_id, d_id]) => (NodeRack[n_ode] = r_id)
+
+(* Property: DPU Affinity - nodes only appear in DPUs they're designated for *)
+DPUAffinity ==
+    \A n_ode \in Nodes, r_id \in Racks, t_id \in Tenants, d_id \in DPUs :
+        (n_ode \in dpu_hw[r_id, t_id, d_id]) => (<<r_id, d_id>> \in NodeDPUs[n_ode])
+
+(* Type Invariant: Configuration consistency - NodeDPUs only references valid racks for each node *)
+ConfigurationConsistency ==
+    \A n_ode \in Nodes :
+        \A rack_dpu \in NodeDPUs[n_ode] :
+            /\ rack_dpu[1] = NodeRack[n_ode]  \* DPU rack matches node's rack
+            /\ rack_dpu[1] \in Racks          \* Rack is valid
+            /\ rack_dpu[2] \in DPUs           \* DPU is valid
 
 (* Fairness: Assume failures eventually stop and reconciliation can make progress *)
 Fairness ==
@@ -371,6 +419,8 @@ Fairness ==
     /\ \A t_id \in Tenants : SF_Vars(TenantDPUHeal)   \* Tenant-DPU networks eventually heal
     /\ WF_Vars(TenantWatch)                            \* Controllers eventually watch events
     /\ WF_Vars(TenantFlush)                            \* Controllers eventually flush buffers
+    /\ WF_Vars(TenantCleanup)                          \* Controllers eventually clean up orphaned CRs
+    /\ WF_Vars(ProcessCRDeletion)                      \* Deletions eventually propagate from etcd
     /\ WF_Vars(DPUReconcile)                           \* DPUs eventually reconcile
 
 Spec == Init /\ [][Next]_Vars /\ Fairness
