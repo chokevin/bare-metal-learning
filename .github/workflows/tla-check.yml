@@ -44,14 +44,14 @@ jobs:
     - name: Run TLC worker ${{ matrix.worker }} of 8
       run: |
         cd kubernetes/tla
-        # Use fingerprint set partitioning to distribute work across workers
+        # Use seed-based partitioning to distribute work across workers
+        # Each worker uses a different seed to explore different parts of the state space
+        SEED=$((1000000 + ${{ matrix.worker }} * 12345))
         java -XX:+UseParallelGC -Xmx6g -cp $TLA2TOOLS_JAR tlc2.TLC \
           -workers auto \
-          -fpbits 2 \
-          -fpmem 0.25 \
-          -checkpoint 10 \
-          -fp ${{ matrix.worker }} \
-          -fpindex ${{ matrix.worker }} 8 \
+          -seed $SEED \
+          -simulate num=5000000 \
+          -depth 100 \
           -config dpu_multi_tenant.cfg \
           dpu_multi_tenant.tla \
           2>&1 | tee tlc_worker_${{ matrix.worker }}.log

@@ -13,9 +13,15 @@ CONSTANTS
     Nodes,          \* Physical nodes, e.g., {"n1", "n2"}
     Racks,          \* Physical racks, e.g., {"r1"}
     DPUs,           \* DPUs per rack, e.g., {"d1", "d2"}
-    Tenants,        \* Customer tenants, e.g., {"t1", "t2"}
-    NodeRack,       \* Node -> Rack mapping. Each node belongs to exactly one rack.
-    NodeDPUs        \* Node -> Set of <<Rack, DPU>> pairs. Defines which DPUs should be programmed for each node.
+    Tenants         \* Customer tenants, e.g., {"t1", "t2"}
+
+\* Configuration: Define node-to-rack and node-to-DPU mappings
+\* Edit these for different topologies
+NodeRack == [n \in Nodes |-> "r1"]  \* All nodes in rack r1
+NodeDPUs == [n \in Nodes |->
+    CASE n \in {"n1", "n2"} -> {<<"r1", "d1">>}  \* n1, n2 use d1
+      [] n = "n3" -> {<<"r1", "d2">>}            \* n3 uses d2
+      [] OTHER -> {<<"r1", "d1">>}]              \* Default to d1
 
 VARIABLES 
     mgmt_nodes,             \* Management plane unassigned nodes: Set of Nodes
@@ -405,6 +411,11 @@ ConfigurationConsistency ==
             /\ rack_dpu[1] = NodeRack[n_ode]  \* DPU rack matches node's rack
             /\ rack_dpu[1] \in Racks          \* Rack is valid
             /\ rack_dpu[2] \in DPUs           \* DPU is valid
+
+(* State constraint to limit state space exploration *)
+StateConstraint ==
+    /\ Cardinality(UNION {tenant_nodes[t] : t \in Tenants}) <= Cardinality(Nodes)
+    /\ Cardinality(UNION {dpu_crs[r, t] : r \in Racks, t \in Tenants}) <= Cardinality(Nodes) + 2
 
 (* Fairness: Assume failures eventually stop and reconciliation can make progress *)
 Fairness ==
