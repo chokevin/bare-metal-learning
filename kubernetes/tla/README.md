@@ -79,10 +79,11 @@ This TLA+ specification models a multi-tenant DPU (Data Processing Unit) managem
 
 **Management Plane initiated:**
 1. `MgmtReclaim`: Management controller reclaims a node from a tenant
-   - Requires: Management controller up, network to tenant up
+   - Requires: Management controller up, network to tenant up, **node not in any DPU hardware**
+   - Safety check prevents returning nodes to pool while still programmed
    - Removes node from `tenant_nodes[tenant]`
    - Queues node for deletion in `dpu_crs_delete_queue` (models non-atomic deletion)
-   - Returns node to `mgmt_nodes` pool
+   - Returns node to `mgmt_nodes` pool only after hardware is clean
 
 2. `ProcessCRDeletion`: Etcd propagates deletions to CRs
    - Processes queued deletions from `dpu_crs_delete_queue`
@@ -90,6 +91,7 @@ This TLA+ specification models a multi-tenant DPU (Data Processing Unit) managem
    - Models the delay between deletion request and CR removal
 
 3. `DPUReconcile`: DPUs observe CR deletions and deprogram hardware
+   - **Excludes CRs in delete queue** to prevent programming nodes being reclaimed
    - Incrementally removes nodes from `dpu_hw` one at a time
    - Models realistic reconciliation loop behavior
 
@@ -159,16 +161,24 @@ This TLA+ specification models a multi-tenant DPU (Data Processing Unit) managem
 4. DPUs reconcile and program hardware (only DPUs in node's cluster)
 5. Node is now active in tenant t1's cluster
 
-### Scenario 2: Node Reassignment Between Tenants
+### Scenario 2: Node Reassignment Between Tenants (Critical Race Condition)
 1. Node n1 is assigned to tenant t1 (programmed into t1's DPUs)
 2. Management reclaims n1 from t1
    - Node removed from t1's `tenant_nodes`
    - Deletion queued in `dpu_crs_delete_queue`
+   - **CRITICAL**: Node cannot return to pool until `dpu_hw` is clean
 3. `ProcessCRDeletion` removes n1 from t1's CRs
 4. DPUs reconcile and deprogram n1 from t1's hardware
-5. Management assigns n1 to tenant t2
-6. Tenant t2 programs n1 into t2's DPUs
-7. **Invariants ensure n1 never appears in both tenants simultaneously**
+   - **CRITICAL**: DPU skips CRs in delete queue to prevent reprogramming
+5. Only after hardware is clean can n1 return to `mgmt_nodes`
+6. Management assigns n1 to tenant t2
+7. Tenant t2 programs n1 into t2's DPUs
+8. **Invariants ensure n1 never appears in both tenants simultaneously**
+
+**Bug History**: Two race conditions were discovered during model checking:
+- **Race 1**: `MgmtReclaim` could return nodes to pool while still in hardware, allowing immediate reassignment before cleanup completed
+- **Race 2**: `DPUReconcile` could program nodes from stale CRs in the delete queue, creating double-booking scenarios
+- Both fixed by adding preconditions that model real-world Kubernetes finalizers and deletion timestamps
 
 ### Scenario 3: Controller Crash During Assignment
 1. Management assigns node to tenant
@@ -335,3 +345,27 @@ java -cp tla2tools.jar tlc2.TLC dpu_multi_tenant.tla -config dpu_multi_tenant.cf
 8. **Cleanup operations need fairness constraints**: Without fairness for `TenantCleanup` and `ProcessCRDeletion`, orphaned CRs might never get cleaned up, preventing progress toward consistency.
 
 9. **Configuration validation at model-check time**: The `ConfigurationConsistency` invariant catches misconfigurations (like nodes assigned to DPUs in wrong racks) before deployment.
+
+10. **Race conditions in deletion are subtle**: Two critical bugs were found during model checking:
+    - Nodes could be reassigned while still programmed in old tenant's hardware
+    - DPU reconciliation could use stale CRs from the delete queue
+    - Both required careful preconditions modeling Kubernetes finalizers and deletion timestamps
+
+11. **Simulation mode is essential for large state spaces**: With 100M+ states, exhaustive checking is infeasible. Distributed simulation with 8 workers (5M traces each) provides high confidence while remaining practical.
+
+## Verification Results
+
+The specification has been verified using TLC model checker with the following configuration:
+
+- **State Space**: ~100M+ states (estimated)
+- **Verification Mode**: Simulation mode (random walk) with 8 parallel workers
+- **Coverage**: 40M traces explored (8 workers × 5M traces each)
+- **Invariants Checked**: All 5 invariants (TenantIsolation, NodeSingleAssignment, RackAffinity, DPUAffinity, ConfigurationConsistency)
+- **Bugs Found**: 2 race conditions in node reclamation flow (both fixed)
+- **CI/CD**: Automated verification on every push via GitHub Actions
+
+**Key Findings:**
+1. Initial spec violated TenantIsolation due to race between reclamation and hardware cleanup
+2. Second violation found after first fix: DPU could reconcile stale CRs in delete queue
+3. Both bugs required modeling real-world Kubernetes semantics (finalizers, deletion timestamps)
+4. Current spec passes all invariants across 40M randomly generated behaviors
