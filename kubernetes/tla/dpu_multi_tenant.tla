@@ -133,8 +133,9 @@ DPUReconcile ==
         /\ rack_power[r] = TRUE
         /\ dpu_online[r, d_id] = TRUE
         /\ tenant_dpu_network[t_id] = TRUE  \* Network must be up
-        \* Only program nodes that should be on this DPU
-        /\ LET target_nodes == {n \in dpu_crs[r, t_id] : <<r, d_id>> \in NodeDPUs[n]}
+        \* Only program nodes that should be on this DPU (excluding pending deletions)
+        /\ LET valid_crs == dpu_crs[r, t_id] \ dpu_crs_delete_queue[r, t_id]  \* Exclude CRs pending deletion
+               target_nodes == {n \in valid_crs : <<r, d_id>> \in NodeDPUs[n]}
                to_remove == dpu_hw[r, t_id, d_id] \ target_nodes
                to_add == target_nodes \ dpu_hw[r, t_id, d_id]
            IN /\ (to_remove # {} \/ to_add # {})  \* Something to reconcile
