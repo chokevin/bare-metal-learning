@@ -82,7 +82,9 @@ MgmtReclaim ==
         /\ mgmt_controller_up = TRUE
         /\ mgmt_tenant_network[t_id] = TRUE  \* Network must be up
         /\ n_ode \in tenant_nodes[t_id]
-        \* Note: Can reclaim even if hardware not cleared - models forced reclamation
+        \* Only return node to pool if it's not in any tenant's hardware
+        /\ \A r_id \in Racks, t_en \in Tenants, d_id \in DPUs :
+             n_ode \notin dpu_hw[r_id, t_en, d_id]
         /\ tenant_nodes' = [tenant_nodes EXCEPT ![t_id] = @ \ {n_ode}]
         /\ mgmt_nodes' = mgmt_nodes \cup {n_ode}
         /\ tenant_events' = [tenant_events EXCEPT ![t_id] = @ \ {n_ode}]  \* Remove from events (DELETE operation)
