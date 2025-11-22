@@ -56,6 +56,33 @@ jobs:
           dpu_multi_tenant.tla \
           2>&1 | tee tlc_worker_${{ matrix.worker }}.log
     
+    - name: Check for errors in TLC output
+      if: always()
+      run: |
+        cd kubernetes/tla
+        if grep -q "Error:" tlc_worker_${{ matrix.worker }}.log; then
+          echo "❌ TLC found an error in worker ${{ matrix.worker }}!"
+          grep -A 20 "Error:" tlc_worker_${{ matrix.worker }}.log
+          exit 1
+        fi
+        if grep -q "Invariant.*is violated" tlc_worker_${{ matrix.worker }}.log; then
+          echo "❌ Invariant violation found in worker ${{ matrix.worker }}!"
+          grep -A 20 "violated" tlc_worker_${{ matrix.worker }}.log
+          exit 1
+        fi
+        if grep -q "Temporal properties were violated" tlc_worker_${{ matrix.worker }}.log; then
+          echo "❌ Temporal property violation found in worker ${{ matrix.worker }}!"
+          grep -A 20 "Temporal properties" tlc_worker_${{ matrix.worker }}.log
+          exit 1
+        fi
+        if grep -q "Finished.*00s" tlc_worker_${{ matrix.worker }}.log && ! grep -q "states generated" tlc_worker_${{ matrix.worker }}.log; then
+          echo "❌ TLC finished too quickly, possibly crashed in worker ${{ matrix.worker }}"
+          exit 1
+        fi
+        echo "✅ Worker ${{ matrix.worker }} completed successfully with no errors"
+        echo "States checked:" $(grep -oP 'The number of states generated: \K[0-9]+' tlc_worker_${{ matrix.worker }}.log || echo "N/A")
+        echo "Traces generated:" $(grep -oP 'Progress:.*\K[0-9]+ traces' tlc_worker_${{ matrix.worker }}.log | head -1 || echo "N/A")
+    
     - name: Upload TLC output for worker ${{ matrix.worker }}
       if: always()
       uses: actions/upload-artifact@v4
