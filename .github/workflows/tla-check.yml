@@ -21,6 +21,10 @@ jobs:
   tla-check:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3, 4, 5, 6, 7, 8]
     
     steps:
     - name: Checkout repository
@@ -37,20 +41,28 @@ jobs:
         wget https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
         echo "TLA2TOOLS_JAR=$(pwd)/tla2tools.jar" >> $GITHUB_ENV
     
-    - name: Run TLC on dpu_multi_tenant
+    - name: Run TLC worker ${{ matrix.worker }} of 8
       run: |
         cd kubernetes/tla
-        java -XX:+UseParallelGC -cp $TLA2TOOLS_JAR tlc2.TLC \
+        # Use fingerprint set partitioning to distribute work across workers
+        java -XX:+UseParallelGC -Xmx6g -cp $TLA2TOOLS_JAR tlc2.TLC \
           -workers auto \
+          -fpbits 2 \
+          -fpmem 0.25 \
+          -checkpoint 10 \
+          -fp ${{ matrix.worker }} \
+          -fpindex ${{ matrix.worker }} 8 \
           -config dpu_multi_tenant.cfg \
-          dpu_multi_tenant.tla
+          dpu_multi_tenant.tla \
+          2>&1 | tee tlc_worker_${{ matrix.worker }}.log
     
-    - name: Upload TLC output
+    - name: Upload TLC output for worker ${{ matrix.worker }}
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: tlc-output
+        name: tlc-output-worker-${{ matrix.worker }}
         path: |
           kubernetes/tla/states/
           kubernetes/tla/*.out
+          kubernetes/tla/tlc_worker_${{ matrix.worker }}.log
         retention-days: 30
